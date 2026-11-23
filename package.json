@@ -1,0 +1,17 @@
+{
+  "name": "pi-clice",
+  "version": "0.1.0",
+  "description": "Compile-aware C and C++ navigation for Pi using Clice's persisted index",
+  "keywords": ["pi-package", "clice", "cpp"],
+  "files": ["src/extension.ts"],
+  "pi": {
+    "extensions": ["./src/extension.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --test test/clice.test.cjs"
+  }
+}
