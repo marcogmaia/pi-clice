@@ -1,7 +1,7 @@
 /**
  * clice: C/C++ semantic queries from pi.
  *
- * Registers `clice_query` and `clice_impact`, backed by the clice CLI, which
+ * Registers `clice_query`, `clice_impact` and `clice_modularize`, backed by the clice CLI, which
  * answers from a persisted compile-accurate project index -- no language
  * server, no buffer sync. A `/clice` command prints binary, root and index
  * status.
@@ -14,6 +14,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -33,6 +34,8 @@ const kQuestions = [
 ] as const;
 
 const kImpactKinds = ["impact-analysis", "file-deps", "project-files"] as const;
+const kModuleViews = ["overview", "edge", "module", "file", "interface", "obstacles", "macros", "impact"] as const;
+type ModuleView = (typeof kModuleViews)[number];
 
 const kFreshModes = ["auto", "always", "off"] as const;
 
@@ -221,11 +224,16 @@ function findWorkspaceRoot(start: string): string | undefined {
 
 // --------------------------------------------------------------- executing
 
+interface ProcessOptions {
+  waitForCloseOnAbort?: boolean;
+}
+
 function runProcess(
   bin: string,
   args: string[],
   cwd: string,
   signal?: AbortSignal,
+  options?: ProcessOptions,
 ): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -249,9 +257,19 @@ function runProcess(
     child.stderr?.on("data", (chunk: string) => {
       stderr += chunk.slice(0, Math.max(0, kMaxChars - stderr.length));
     });
-    child.on("error", reject);
+    let abortError: Error | undefined;
+    child.on("error", (error) => {
+      // Analysis owns input files that the child may still have open on AbortError.
+      if (options?.waitForCloseOnAbort && signal?.aborted && error.name === "AbortError") {
+        abortError = error;
+      } else {
+        reject(error);
+      }
+    });
     child.on("close", (code, exitSignal) => {
-      if (code === null) {
+      if (abortError) {
+        reject(abortError);
+      } else if (code === null) {
         const reason = child.killed && !signal?.aborted
           ? `timed out after ${kTimeoutMs / 1000} seconds`
           : `terminated (${exitSignal ?? "unknown signal"})`;
@@ -320,9 +338,10 @@ async function safeRun(
   args: string[],
   cwd: string,
   signal?: AbortSignal,
+  options?: ProcessOptions,
 ): Promise<ProcessResult> {
   try {
-    return await runProcess(bin, args, cwd, signal);
+    return await runProcess(bin, args, cwd, signal, options);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { code: -1, stdout: "", stderr: `could not run clice: ${message}` };
@@ -687,6 +706,585 @@ function renderImpactAnswer(root: string, kind: string, answer: CliceAnswer): st
   return renderProjectFiles(root, answer);
 }
 
+// --------------------------------------------------------- module analysis
+
+interface AnalysisRequest {
+  view?: ModuleView;
+  target?: string;
+  to?: string;
+  scope?: string[];
+  dirDepth?: number;
+  partition?: string | object;
+  std?: string;
+  moves?: string[];
+  merges?: string[];
+  entityMoves?: string[];
+  annotations?: (string | object)[];
+  churnSince?: string;
+  limit?: number;
+  configuration?: string;
+  includeExternal?: boolean;
+  fresh?: (typeof kFreshModes)[number];
+}
+
+interface ResolvedAnalysisRequest extends Omit<AnalysisRequest, "partition" | "annotations"> {
+  partition?: string;
+  annotations?: string[];
+}
+
+interface AnalysisAnswer {
+  data?: unknown;
+  error?: string;
+  stale?: string[];
+  parseFailed?: boolean;
+}
+
+class JsonInputWriteError extends Error {
+  constructor(readonly file: string, cause: unknown) {
+    super("Could not write temporary analysis input", { cause });
+  }
+}
+
+function writeJsonInput(value: string | object): string {
+  if (typeof value === "string") return value;
+  const json = JSON.stringify(value);
+  const file = path.join(os.tmpdir(), `pi-clice-${randomUUID()}.json`);
+  const fd = fs.openSync(file, "wx", 0o600);
+  try {
+    try {
+      fs.writeFileSync(fd, json);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (error) {
+    throw new JsonInputWriteError(file, error);
+  }
+  return file;
+}
+
+function resolveInputs(request: AnalysisRequest, paths: string[] = []) {
+  const resolve = (value: string | object) => {
+    try {
+      const file = writeJsonInput(value);
+      if (typeof value !== "string") paths.push(file);
+      return file;
+    } catch (error) {
+      // Hand any owned, partially written file to the same disposer.
+      if (error instanceof JsonInputWriteError) paths.push(error.file);
+      throw error;
+    }
+  };
+  const resolved: ResolvedAnalysisRequest = {
+    ...request,
+    partition: request.partition === undefined ? undefined : resolve(request.partition),
+    annotations: request.annotations?.map(resolve),
+  };
+  return { request: resolved, paths };
+}
+
+const kAnalysisRepeatedFlags = {
+  scope: "--scope", moves: "--move", merges: "--merge", entityMoves: "--move-entity",
+} as const;
+const kAnalysisPathFlags = {
+  partition: "--partition", std: "--std", configuration: "--configuration",
+} as const;
+const kAnalysisDirections = {
+  overview: [], edge: ["target", "to"], module: ["target"], file: ["target"],
+  interface: ["target"], obstacles: [], macros: [], impact: [],
+} as const satisfies Record<ModuleView, readonly ("target" | "to")[]>;
+
+function acceptsAnnotations(view: ModuleView): boolean {
+  return view === "overview" || view === "file" || view === "impact";
+}
+
+export function buildAnalysisArgs(request: ResolvedAnalysisRequest, root: string): string[] {
+  const view = request.view ?? "overview";
+  const args = ["analyze", "modules"];
+  if (view !== "overview") args.push(view);
+  const flag = (name: string, value: string | number | undefined) => {
+    if (value !== undefined) args.push(name, String(value));
+  };
+  for (const key of kAnalysisDirections[view]) {
+    if (request[key] !== undefined) args.push(request[key]);
+  }
+  for (const key of Object.keys(kAnalysisRepeatedFlags) as (keyof typeof kAnalysisRepeatedFlags)[]) {
+    for (const value of request[key] ?? []) flag(kAnalysisRepeatedFlags[key], value);
+  }
+  flag("--dir-depth", request.dirDepth);
+  for (const key of Object.keys(kAnalysisPathFlags) as (keyof typeof kAnalysisPathFlags)[]) {
+    flag(kAnalysisPathFlags[key], request[key]);
+  }
+  if (view === "overview") flag("--limit", request.limit);
+  if (acceptsAnnotations(view)) {
+    for (const file of request.annotations ?? []) flag("--annotation", file);
+    flag("--churn-since", request.churnSince);
+  }
+  args.push("--workspace", root);
+  return args;
+}
+
+export function checkAnalysisRequest(request: AnalysisRequest): string | null {
+  const view = request.view ?? "overview";
+  if (!kModuleViews.includes(view)) return `Unknown module analysis view: ${view}.`;
+  for (const key of ["target", "to"] as const) {
+    const value = request[key];
+    if (!(kAnalysisDirections[view] as readonly string[]).includes(key)) {
+      if (value !== undefined) return `view: ${view} does not accept ${key}.`;
+    } else if (view !== "interface" || value !== undefined) {
+      if (!value?.trim()) return `view: ${view} needs ${key}.`;
+    }
+  }
+  if (!acceptsAnnotations(view)) {
+    for (const key of ["annotations", "churnSince"] as const) {
+      if (request[key] !== undefined) return `view: ${view} does not accept ${key}.`;
+    }
+  }
+  for (const key of ["dirDepth", "limit"] as const) {
+    if (badCount(request[key])) return `${key} must be a whole number, 0 or more.`;
+  }
+  for (const [key, values] of Object.entries({
+    target: [request.target], to: [request.to], partition: [request.partition], std: [request.std],
+    configuration: [request.configuration], churnSince: [request.churnSince],
+    scope: request.scope, moves: request.moves, merges: request.merges,
+    entityMoves: request.entityMoves, annotations: request.annotations,
+  })) {
+    if (values?.some((value) => typeof value === "string" && value.trimStart().startsWith("-"))) {
+      return `${key} values may not start with \`-\`.`;
+    }
+  }
+  return null;
+}
+
+export function parseAnalysis(result: ProcessResult): AnalysisAnswer {
+  const text = result.stdout.trim();
+  const unreadable = () => ({
+    error: `unreadable clice output${text ? `: ${text.slice(0, 300)}` : ""}`,
+    parseFailed: true,
+  });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return unreadable();
+  }
+  if (!parsed || typeof parsed !== "object") return unreadable();
+  const { error, stale } = parsed as { error?: unknown; stale?: unknown };
+  const stalePaths = Array.isArray(stale) ? stale.filter((file): file is string => typeof file === "string") : undefined;
+  if (typeof error === "string" && error.length > 0) return { error, stale: stalePaths };
+  if (result.code !== 0) return { ...unreadable(), stale: stalePaths };
+  return { data: parsed };
+}
+
+function runAnalysis(bin: string, args: string[], root: string, signal?: AbortSignal): Promise<ProcessResult> {
+  return safeRun(bin, args, root, signal, { waitForCloseOnAbort: true });
+}
+
+async function cliceModularizeFresh(
+  bin: string, root: string, fresh: AnalysisRequest["fresh"], signal?: AbortSignal,
+): Promise<string | undefined> {
+  if (fresh !== "always") return;
+  const result = await safeRun(bin, ["query", "project-files", "--fresh", "--workspace", root], root, signal);
+  const answer = parseAnswer(result);
+  if (result.code === 0 && !answer.parseFailed) return;
+  return answer.error ?? `clice exited with code ${result.code}`;
+}
+
+// ---------------------------------------------------- module analysis text
+
+const kAnalysisBudget = kMaxChars - 1;
+const kOmittedSections = "(sections omitted to fit; narrow with scope or a lower limit)";
+const kObstacleKeys = [
+  "variantHeaders", "contextMacros", "borrowedMacros", "internalUses",
+  "crossModuleRedeclarations", "foreignDeclarations", "splitDefinitions", "duplicateDefinitions",
+  "configuringMacros", "implicitProviders", "specializations",
+] as const;
+type ObstacleKey = (typeof kObstacleKeys)[number];
+
+interface ModuleCost {
+  path: string;
+  baseline: number;
+  partitioned: number;
+  churn: number;
+  internal: boolean;
+}
+
+interface ModuleEntry {
+  name: string;
+  headers: number;
+  sources: number;
+  lines: number;
+  layer: number;
+}
+
+interface OverviewAnswer {
+  files: number;
+  modules: ModuleEntry[];
+  edges: { interfaceEntities: number }[];
+  cycles: { modules: string[]; cut: { from: string; to: string; entities: number }[] }[];
+  cyclicModules: number;
+  partitionCycles: object[];
+  internalHeaders: number;
+  deepestChain: string[];
+  totals: { baseline: number; partitioned: number };
+  hotspots: ModuleCost[];
+  moves: { path: string; from: string; to: string; with: string[]; entities: number }[];
+  splits: { path: string; parts: { count: number }[] }[];
+  obstacles: Partial<Record<ObstacleKey, number>>;
+}
+
+interface AnalysisBlock {
+  rows: string[];
+  hidden: number;
+  outside: number;
+  format: (rows: string[], tail: string[]) => string;
+  section?: "splits" | "moves" | "hotspots";
+}
+
+function analysisExternal(root: string, request: AnalysisRequest, value: string): boolean {
+  return !request.includeExternal && (isExternalPath(root, value) ||
+    relativeToRoot(root, value).split("/").some((segment) => segment === "build" || /^\..+/.test(segment)));
+}
+
+function analysisRows<T>(
+  items: readonly T[], cap: number, render: (item: T) => string,
+  external: (item: T) => boolean = () => false,
+  format: AnalysisBlock["format"] = (rows, tail) => [...rows, ...tail].join("\n"),
+): AnalysisBlock {
+  const visible = items.filter((item) => !external(item));
+  const shown = visible.slice(0, cap);
+  return { rows: shown.map(render), hidden: visible.length - shown.length, outside: items.length - visible.length, format };
+}
+
+function analysisLine(line: string): AnalysisBlock {
+  return analysisRows([line], 1, (value) => value);
+}
+
+function renderAnalysisBlock(block: AnalysisBlock, count = block.rows.length): string {
+  const hidden = block.hidden + block.rows.length - count;
+  const tail = [];
+  if (block.outside) tail.push(`(+${block.outside} outside the project)`);
+  if (hidden) tail.push(`(+${hidden} hidden)`);
+  return block.format(block.rows.slice(0, count), tail);
+}
+
+function fitAnalysisBlocks(blocks: AnalysisBlock[], budget: number): string {
+  const entries = blocks.map((block) => ({ block, text: renderAnalysisBlock(block) }));
+  let note = "";
+  const join = () => [...entries.map(({ text }) => text), note].filter(Boolean).join("\n");
+  for (const section of ["splits", "moves", "hotspots"] as const) {
+    if (join().length <= budget) break;
+    const index = entries.findIndex(({ block }) => block.section === section);
+    if (index !== -1) {
+      entries.splice(index, 1);
+      note = kOmittedSections;
+    }
+  }
+  // Preserve whole records. Shed tails from the bottom, retaining the count on each list.
+  for (let i = entries.length - 1; i >= 0 && join().length > budget; i--) {
+    const entry = entries[i];
+    if (!entry.block.rows.length) continue;
+    let low = 0;
+    let high = entry.block.rows.length - 1;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      entry.text = renderAnalysisBlock(entry.block, mid);
+      if (join().length <= budget) low = mid;
+      else high = mid - 1;
+    }
+    entry.text = renderAnalysisBlock(entry.block, low);
+  }
+  return join();
+}
+
+function pct(part: number, whole: number): number {
+  return whole ? Math.round(100 * part / whole) : 0;
+}
+
+function ratio(partitioned: number, baseline: number): string {
+  if (partitioned === baseline) return "x1.0 unchanged";
+  if (baseline === 0) return "ratio unavailable (zero baseline)";
+  return `x${(partitioned / baseline).toFixed(1)} ${partitioned > baseline ? "worse" : "cheaper"}`;
+}
+
+function moduleLine(root: string, entry: ModuleEntry): string {
+  return `layer ${entry.layer}  ${relativeToRoot(root, entry.name)}  h${entry.headers}  s${entry.sources}  ${entry.lines} lines`;
+}
+
+function orderedObstacles<T>(obstacles: Partial<Record<ObstacleKey, T>>, count: (value: T) => number) {
+  return kObstacleKeys.flatMap((key) => {
+    const value = obstacles[key];
+    return value === undefined || !count(value) ? [] : [{ key, value, count: count(value) }];
+  }).sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+}
+
+export function renderOverview(
+  root: string, data: OverviewAnswer, request: AnalysisRequest, budget = kAnalysisBudget,
+): string {
+  const limit = request.limit ?? 20;
+  const rel = (file: string) => relativeToRoot(root, file);
+  const outside = (file: string) => analysisExternal(root, request, file);
+  const inProject = data.modules.filter(({ name }) => !analysisExternal(root, {}, name)).length;
+  const moduleSummary = `modules ${data.modules.length}  (${inProject} in-project, ${data.modules.length - inProject} outside the project)`;
+  const cycleRows = analysisRows(data.cycles, 5, ({ modules, cut }) => {
+    const cuts = cut.map(({ from, to, entities }) => `cut ${rel(from)} -> ${rel(to)} (${entities} entities)`);
+    return `            ${modules.map(rel).join(" <-> ")}${cuts.length ? `  ${cuts.join(", ")}` : ""}`;
+  }, ({ modules, cut }) => modules.some(outside) || cut.some(({ from, to }) => outside(from) || outside(to)));
+  const layers = analysisRows([...data.modules].sort((a, b) => b.layer - a.layer || b.lines - a.lines), 12,
+    (entry) => moduleLine(root, entry), ({ name }) => outside(name));
+  const section = <T>(
+    name: NonNullable<AnalysisBlock["section"]>, items: T[], render: (item: T) => string,
+    external: (item: T) => boolean,
+  ): AnalysisBlock => ({
+    ...analysisRows(items, limit, (item) => `  ${render(item)}`, external,
+      (rows, tail) => [`${name} (${name === "hotspots" ? `limit ${limit}` : items.length})`, ...rows, ...tail].join("\n")),
+    section: name,
+  });
+  const hotspots = [...data.hotspots].sort((a, b) => b.churn * b.partitioned - a.churn * a.partitioned);
+  const { baseline, partitioned } = data.totals;
+  const proposed = request.partition !== undefined || Boolean(
+    request.moves?.length || request.merges?.length || request.entityMoves?.length,
+  );
+  const costLabel = proposed ? "with the proposed partition" : "if grouped by folder";
+  const cycleHeading = `cycles      ${data.cyclicModules} modules in a cycle, ${data.partitionCycles.length} inside a single module`;
+  cycleRows.format = (rows, tail) => {
+    const details = [...rows];
+    // Fit all five rows without pushing cost past line 10.
+    const head = details.length === 5 ? `${cycleHeading}  ${details.shift()!.trimStart()}` : cycleHeading;
+    const lines = [head, ...details];
+    if (tail.length) lines[lines.length - 1] += `  ${tail.join(" ")}`;
+    return lines.join("\n");
+  };
+  return fitAnalysisBlocks([
+    analysisLine(`${moduleSummary}  files ${data.files}  edges ${data.edges.length}`),
+    analysisLine(`crossings   ${data.edges.length} edges, ${data.edges.reduce((sum, edge) => sum + edge.interfaceEntities, 0)} interface entities`),
+    cycleRows,
+    analysisRows(data.deepestChain, Infinity, (step) => step, () => false, (rows, tail) =>
+      `chain       ${data.deepestChain.length} deep: ${[rows.join(" > "), ...tail].filter(Boolean).join(" ")}`),
+    analysisLine(`shape       ${data.internalHeaders} internal headers, ${data.splits.length} split candidates, ${data.moves.length} move candidates`),
+    analysisLine(`cost        rebuild units ${baseline} today -> ${partitioned} ${costLabel}   (${ratio(partitioned, baseline)})`),
+    analysisLine("---------------------------------------------------------------------"),
+    layers,
+    section("hotspots", hotspots,
+      (item) => `${rel(item.path)}  ${item.baseline} -> ${item.partitioned} rebuild units  ${item.churn} commits`,
+      (item) => outside(item.path)),
+    section("moves", data.moves,
+      (item) => `${rel(item.path)}  from ${rel(item.from)} to ${rel(item.to)}  +${item.with.length} files, ${item.entities} entities`,
+      (item) => [item.path, item.from, item.to].some(outside)),
+    section("splits", data.splits,
+      (item) => `${rel(item.path)}  ${item.parts.length} groups (${item.parts.map(({ count }) => count).join(" / ")} entities by consumer)`,
+      (item) => outside(item.path)),
+    analysisLine(`obstacles  ${orderedObstacles(data.obstacles, (value) => value).map(({ key, count }) => `${count} ${key}`).join(", ")}`.trimEnd()),
+  ], budget);
+}
+
+interface ModuleLinks<T> {
+  module: string;
+  entities: T;
+}
+
+interface ModuleAnswer {
+  name: string;
+  files: { path: string; source: boolean; uses: ModuleLinks<number>[]; usedBy: ModuleLinks<number>[] }[];
+  groups: { consumers: string[]; headers: string[]; dependsOn: string[] }[];
+  internalHeaders: string[];
+}
+
+interface ModuleFileAnswer {
+  path: string;
+  module: string;
+  source: boolean;
+  annotations: { name: string; unit: string; value: number }[];
+  uses: ModuleLinks<string[]>[];
+  usedBy: ModuleLinks<string[]>[];
+  affinity: ModuleLinks<number>[];
+}
+
+interface EdgeAnswer {
+  from: string;
+  to: string;
+  entities: { entity: string; owner: string; users: string[] }[];
+}
+
+interface InterfaceAnswer {
+  module: string;
+  imports: string[];
+  entries: { file: string; names: string[]; include: string }[];
+  exports: unknown[];
+  textual: unknown[];
+  sharedLocals: unknown[];
+  macros: unknown[];
+  reads: unknown[];
+}
+
+type ObstacleAnswer = Partial<Record<ObstacleKey, unknown[]>> & {
+  internalUses?: { entity: string; owner: string; reason: string }[];
+  implicitProviders?: { path: string; specializes: string[] }[];
+};
+
+function inlineAnalysis(rows: string[], tail: string[]): string {
+  return [rows.join(", "), ...tail].filter(Boolean).join(" ");
+}
+
+function analysisNames(root: string, request: AnalysisRequest, items: string[], cap = Infinity): string {
+  return renderAnalysisBlock(analysisRows(items, cap, (item) => relativeToRoot(root, item),
+    (item) => analysisExternal(root, request, item), inlineAnalysis));
+}
+
+export function renderModuleView(
+  root: string, data: ModuleAnswer, request: AnalysisRequest, budget = kAnalysisBudget,
+): string {
+  const outside = (file: string) => analysisExternal(root, request, file);
+  const links = (items: ModuleLinks<number>[]) => renderAnalysisBlock(analysisRows(items, Infinity,
+    ({ module, entities }) => `${relativeToRoot(root, module)}(${entities})`, ({ module }) => outside(module), inlineAnalysis));
+  return fitAnalysisBlocks([
+    analysisRows(data.groups, Infinity, ({ consumers, headers }) =>
+      `${consumers.length} consumers: ${analysisNames(root, request, headers, 8)}  (${analysisNames(root, request, consumers)})`),
+    analysisRows(data.internalHeaders, Infinity, (file) => relativeToRoot(root, file), outside,
+      (rows, tail) => `internal headers: ${inlineAnalysis(rows, tail) || "none"}`),
+    analysisRows(data.files, 40, (file) =>
+      `${relativeToRoot(root, file.path)}  uses: ${links(file.uses) || "none"}  used by: ${links(file.usedBy) || "none"}`,
+    ({ path }) => outside(path)),
+  ], budget);
+}
+
+export function renderFileView(
+  root: string, data: ModuleFileAnswer, request: AnalysisRequest, budget = kAnalysisBudget,
+): string {
+  const rel = (file: string) => relativeToRoot(root, file);
+  const total = data.affinity.reduce((sum, { entities }) => sum + entities, 0);
+  const moduleList = <T>(
+    label: string, items: ModuleLinks<T>[], render: (item: ModuleLinks<T>) => string,
+  ): AnalysisBlock => {
+    const block = analysisRows(items, 5, render, ({ module }) => analysisExternal(root, request, module));
+    block.format = (rows, tail) => {
+      const hidden = block.hidden + block.rows.length - rows.length;
+      const more = hidden ? [`(+${hidden} module${hidden === 1 ? "" : "s"})`] : [];
+      return `${label}${inlineAnalysis(rows, [...more, ...tail]) || "none"}`;
+    };
+    return block;
+  };
+  const uses = [...data.uses].sort((a, b) => b.entities.length - a.entities.length);
+  const affinity = [...data.affinity].sort((a, b) => b.entities - a.entities);
+  return fitAnalysisBlocks([
+    analysisLine(`${rel(data.path)}   in ${rel(data.module)}   (${data.source ? "source" : "header"})`),
+    moduleList("uses          ", uses, ({ module, entities }) => `${rel(module)} ${entities.length}`),
+    moduleList("used by       ", data.usedBy, ({ module }) => rel(module)),
+    moduleList("affinity      ", affinity, ({ module, entities }) => `${rel(module)} ${entities} (${pct(entities, total)}%)`),
+    analysisRows(data.annotations, Infinity, ({ name, value, unit }) => `${name} ${value} ${unit}`.trimEnd(),
+      () => false, (rows, tail) => `annotations  ${inlineAnalysis(rows, tail) || "none"}`),
+  ], budget);
+}
+
+export function renderEdgeView(
+  root: string, data: EdgeAnswer, request: AnalysisRequest, budget = kAnalysisBudget,
+): string {
+  const rel = (file: string) => relativeToRoot(root, file);
+  const site = (value: string) => /^(.*)(:\d+)$/.exec(value);
+  const entities = [...data.entities].sort((a, b) => b.users.length - a.users.length);
+  return fitAnalysisBlocks([
+    analysisLine(`${rel(data.from)} -> ${rel(data.to)}  (${rel(data.from)} names ${rel(data.to)}'s entities)`),
+    analysisRows(entities, 40, ({ entity, owner, users }) => {
+      const sites = renderAnalysisBlock(analysisRows(users, 2, (value) => {
+        const match = site(value);
+        return match ? `${rel(match[1])}${match[2]}` : rel(value);
+      }, (value) => analysisExternal(root, request, site(value)?.[1] ?? value), inlineAnalysis));
+      return `${entity}  ${rel(owner)}  ${users.length} uses${sites ? `  ${sites}` : ""}`;
+    }, ({ owner }) => analysisExternal(root, request, owner)),
+  ], budget);
+}
+
+export function renderInterface(
+  root: string, data: InterfaceAnswer[], request: AnalysisRequest, budget = kAnalysisBudget,
+): string {
+  const outside = (file: string) => analysisExternal(root, request, file);
+  const renderModule = (item: InterfaceAnswer) => {
+    const imports = analysisNames(root, request, item.imports, 5);
+    const entries = renderAnalysisBlock(analysisRows(item.entries, 15, ({ names, include }) => {
+      const spelling = /^[<"]/.test(include) ? include : `<${include}>`;
+      return `  ${names.join(", ")}  ${spelling}`;
+    }, ({ file }) => outside(file)));
+    return [
+      relativeToRoot(root, item.module),
+      `imports (${item.imports.length})${imports ? `: ${imports}` : ""}`,
+      `entries (${item.entries.length})`, entries, `exports ${item.exports.length}`, `textual (${item.textual.length})`,
+      `shared locals (${item.sharedLocals.length})`, `macros (${item.macros.length})`, `reads (${item.reads.length})`,
+    ].filter(Boolean).join("\n");
+  };
+  let empty = 0;
+  const substantive = data.filter((item) => {
+    if (item.entries.length || item.imports.length || outside(item.module)) return true;
+    empty++;
+    return false;
+  });
+  // Empty modules described by the summary do not consume the detail cap.
+  const blocks = [analysisRows(substantive, 12, renderModule, ({ module }) => outside(module))];
+  if (empty) blocks.push(analysisLine(`${empty} module(s) with no entries or imports`));
+  if (!data.length) blocks.push(analysisLine("0 modules"));
+  return fitAnalysisBlocks(blocks, budget);
+}
+
+export function renderObstacles(
+  root: string, data: ObstacleAnswer, request: AnalysisRequest, budget = kAnalysisBudget,
+): string {
+  const keys = kObstacleKeys.filter((key) => Object.hasOwn(data, key));
+  if (!keys.length || keys.some((key) => !Array.isArray(data[key]))) {
+    throw new TypeError("Expected obstacle arrays");
+  }
+  const limit = request.limit ?? 20;
+  const outside = (file: string) => analysisExternal(root, request, file);
+  const rel = (file: string) => relativeToRoot(root, file);
+  const blocks = orderedObstacles(data, (items) => items.length).map(({ key, count }) => {
+    const title = `${key} (${count})`;
+    const format: AnalysisBlock["format"] = (rows, tail) => [title, ...rows, ...tail].join("\n");
+    if (key === "internalUses") {
+      return analysisRows(data.internalUses!, limit, ({ entity, owner, reason }) => `  ${entity}  ${rel(owner)}  ${reason}`,
+        ({ owner }) => outside(owner), format);
+    }
+    if (key === "implicitProviders") {
+      return analysisRows(data.implicitProviders!, limit, ({ path, specializes }) => `  ${rel(path)}  specializes: ${specializes.join(", ")}`,
+        ({ path }) => outside(path), format);
+    }
+    return analysisLine(title);
+  });
+  return fitAnalysisBlocks(blocks.length ? blocks : [analysisLine("No obstacles")], budget);
+}
+
+export function renderMacros(root: string, data: unknown[], request: AnalysisRequest, budget = kAnalysisBudget): string {
+  const summaryValue = (value: unknown): unknown => {
+    // Treat only unmistakable absolute paths as paths, without guessing macro keys.
+    if (typeof value === "string" && (path.isAbsolute(value) || /^[a-z]:[\\/]/i.test(value))) {
+      return analysisExternal(root, request, value) ? "(+1 outside the project)" : relativeToRoot(root, value);
+    }
+    if (Array.isArray(value)) return value.map(summaryValue);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, summaryValue(child)]));
+    }
+    return value;
+  };
+  return fitAnalysisBlocks([
+    analysisLine(`${data.length} crossing macro(s)`),
+    analysisRows(data, request.limit ?? 5, (item) => {
+      if (!item || typeof item !== "object") return `  ${JSON.stringify(summaryValue(item))}`;
+      const fields = Object.entries(item).map(([key, value]) => `${JSON.stringify(key)}=${JSON.stringify(summaryValue(value))}`);
+      return `  ${fields.length ? fields.join(", ") : JSON.stringify(item)}`;
+    }),
+  ], budget);
+}
+
+export function renderModuleImpact(
+  root: string, data: ModuleCost[], request: AnalysisRequest, budget = kAnalysisBudget,
+): string {
+  const delta = ({ baseline, partitioned }: ModuleCost) => partitioned - baseline;
+  const items = [...data].sort((a, b) => delta(b) - delta(a));
+  return fitAnalysisBlocks([
+    analysisRows(items, Math.min(request.limit ?? 40, 40), (item) => {
+      const difference = delta(item);
+      return `${relativeToRoot(root, item.path)}  ${item.baseline} -> ${item.partitioned}  (${difference >= 0 ? "+" : ""}${difference})${item.internal ? " [internal]" : ""}`;
+    }, ({ path }) => analysisExternal(root, request, path)),
+    ...(items.length ? [] : [analysisLine("0 files")]),
+  ], budget);
+}
+
 // ------------------------------------------------------------------- setup
 
 /** A string enum JSON Schema that keeps its literal union in Static. */
@@ -805,6 +1403,107 @@ async function executeRequest(cwd: string, request: ToolRequest, signal?: AbortS
   return renderRun(root, target, request, run);
 }
 
+function diagnosticText(value: string, max = 500): string {
+  const text = value.trim().replace(/\s+/g, " ");
+  return text.length <= max ? text : `${text.slice(0, max)} (+${text.length - max} characters hidden)`;
+}
+
+function renderAnalysisData(root: string, data: unknown, request: AnalysisRequest, budget: number): string {
+  const view = request.view ?? "overview";
+  if (view === "impact" || view === "interface" || view === "macros") {
+    if (!Array.isArray(data)) throw new TypeError("Expected an analysis array");
+    if (view === "impact") return renderModuleImpact(root, data, request, budget);
+    if (view === "interface") return renderInterface(root, data, request, budget);
+    return renderMacros(root, data, request, budget);
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) throw new TypeError("Expected an analysis object");
+  switch (view) {
+    case "overview": return renderOverview(root, data as OverviewAnswer, request, budget);
+    case "edge": return renderEdgeView(root, data as EdgeAnswer, request, budget);
+    case "module": return renderModuleView(root, data as ModuleAnswer, request, budget);
+    case "file": return renderFileView(root, data as ModuleFileAnswer, request, budget);
+    case "obstacles": return renderObstacles(root, data as ObstacleAnswer, request, budget);
+  }
+}
+
+async function executeModularize(cwd: string, request: AnalysisRequest, signal?: AbortSignal) {
+  if (signal?.aborted) return fail("Cancelled");
+  const issue = checkAnalysisRequest(request);
+  if (issue) return fail(diagnosticText(issue));
+  const bin = resolveBinary();
+  if (!bin) return fail(missingBinaryText());
+  const root = findWorkspaceRoot(cwd) ?? path.resolve(cwd);
+  const view = request.view ?? "overview";
+  const paths: string[] = [];
+  try {
+    try {
+      const { request: resolved } = resolveInputs(request, paths);
+      const refreshError = await cliceModularizeFresh(bin, root, request.fresh, signal);
+      if (signal?.aborted) return fail("Cancelled");
+      const result = await runAnalysis(bin, buildAnalysisArgs(resolved, root), root, signal);
+      if (signal?.aborted) return fail("Cancelled");
+      const answer = parseAnalysis(result);
+      const warning = refreshError ? `\nwarning: index refresh failed (${diagnosticText(refreshError)}).` : "";
+      const budget = kAnalysisBudget - warning.length;
+      const stale = answer.stale ?? [];
+      const details = { view, root, code: result.code, refreshed: request.fresh === "always" && !refreshError, stale };
+      const respond = (body: string, isError: boolean) => ({
+        content: [{ type: "text" as const, text: body + warning }], details, isError,
+      });
+      if (!answer.error && result.code === 0) {
+        try {
+          return respond(renderAnalysisData(root, answer.data, request, budget), false);
+        } catch (error) {
+          if (!(error instanceof TypeError)) throw error;
+          return respond(`unreadable clice output: ${result.stdout.slice(0, 300)}`, true);
+        }
+      }
+      const message = answer.error ?? `clice exited with code ${result.code}`;
+      const isNegative = result.code === 1 && !answer.parseFailed;
+      const blocks: AnalysisBlock[] = [];
+      if (result.code === 2 && /unknown subcommand/i.test(`${message}\n${result.stderr.slice(0, 500)}`)) {
+        const version = await safeRun(bin, ["--version"], root, signal);
+        if (signal?.aborted) return fail("Cancelled");
+        const detected = /clice-io\.clice-[0-9.]+/.exec(bin)?.[0];
+        const label = (version.code === 0 && diagnosticText(version.stdout, 120)) || detected || "version unknown";
+        blocks.push(analysisLine(`This clice binary is too old for analyze modules (${label}): ${diagnosticText(bin)}.`));
+      } else if (answer.parseFailed) {
+        const reason = result.code === -1 && result.stderr ? ` (${diagnosticText(result.stderr)})` : "";
+        blocks.push(analysisLine(`${message}${reason}`));
+      } else {
+        blocks.push(analysisLine(`clice: ${diagnosticText(message)}`));
+        if (isNegative) {
+          if (view === "module" || view === "edge" || view === "interface") {
+            blocks.push(analysisLine("Hint: module names come from view: overview."));
+          } else if (view === "file") {
+            blocks.push(analysisLine("Hint: pass a path relative to the project root."));
+          }
+        } else if (result.code === 2) {
+          blocks.push(analysisLine(`Check the configuration and index; use clice index with the resolved binary: ${diagnosticText(bin)}.`));
+        }
+      }
+      if (stale.length) {
+        blocks.push(analysisRows(stale, Infinity, (file) => relativeToRoot(root, file),
+          (file) => analysisExternal(root, request, file),
+          (rows, tail) => `stale: ${stale.length} index unit(s) missing: ${inlineAnalysis(rows, tail)}`));
+      }
+      return respond(fitAnalysisBlocks(blocks, budget), !isNegative);
+    } finally {
+      let cleanupError: unknown;
+      for (const file of paths) {
+        try {
+          fs.rmSync(file, { force: true });
+        } catch (error) {
+          cleanupError ??= error;
+        }
+      }
+      if (cleanupError) throw cleanupError;
+    }
+  } catch (error) {
+    return fail(`clice module analysis failed: ${diagnosticText(error instanceof Error ? error.message : String(error))}`);
+  }
+}
+
 function describeIndex(stats: ProcessResult): string {
   const diagnostics = shortText(stats.stderr || stats.stdout, 500);
   if (stats.code !== 0) {
@@ -829,11 +1528,21 @@ function querySuggestions(question: string): string {
   return "a locator: a name, `ns::Class::method`, `file.cpp:120:8`, or a printed `[...]` symbol";
 }
 
+const modularizePromptSnippet =
+  "Survey a C++ project's module shape: crossings, cycles, split and move candidates, rebuild cost";
+const modularizePromptGuidelines = [
+  "Start with clice_modularize view overview: it prints what it costs to understand the project and what a rebuild costs today versus grouped by folder. If the second number is higher, do not propose that grouping.",
+  "Test a structure before editing anything: pass partition, moves, merges or entityMoves and the answer measures the hypothetical. No file changes.",
+  "Drill with view module (each group is a line the folder splits along), view file (affinity ranks modules by total coupling with the file, in both directions) and view edge (the entities that cut a cycle).",
+  "clice_modularize never writes. Turning code into importable modules is a separate, destructive step a person runs; clear view obstacles first.",
+  'After editing sources, pass fresh: "always" - analyses read a saved copy of the project.',
+];
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     if (findWorkspaceRoot(ctx.cwd)) return;
     const active = pi.getActiveTools();
-    const remaining = active.filter((name) => name !== "clice_query" && name !== "clice_impact");
+    const remaining = active.filter((name) => name !== "clice_query" && name !== "clice_impact" && name !== "clice_modularize");
     if (remaining.length !== active.length) pi.setActiveTools(remaining);
   });
 
@@ -937,6 +1646,36 @@ export default function (pi: ExtensionAPI) {
 
     execute(_toolCallId, { kind, ...params }, signal, _onUpdate, ctx) {
       return executeRequest(ctx.cwd, { ...params, question: kind }, signal);
+    },
+  });
+
+  const jsonInput = Type.Union([Type.String(), Type.Record(Type.String(), Type.Unknown())]);
+  pi.registerTool({
+    name: "clice_modularize",
+    label: "clice Modularize Analysis",
+    description: "Analyze C++ module boundaries and hypothetical partitions with clice: Reads a saved index; never writes and never runs `clice modularize`.",
+    promptSnippet: modularizePromptSnippet,
+    promptGuidelines: modularizePromptGuidelines,
+    parameters: Type.Object({
+      view: Type.Optional(enumField(kModuleViews, "Module analysis view (default overview).")),
+      target: Type.Optional(Type.String({ description: "Module name for edge and module, path for file, optional module for interface; rejected otherwise." })),
+      to: Type.Optional(Type.String({ description: "Required for edge only: the module whose entities target names." })),
+      scope: Type.Optional(Type.Array(Type.String(), { description: "Globs relative to the workspace root." })),
+      dirDepth: Type.Optional(Type.Integer({ minimum: 0, description: "Default module directory depth; 0 means the whole directory (default)." })),
+      partition: Type.Optional(jsonInput),
+      std: Type.Optional(Type.String({ description: "libc++ module sources directory." })),
+      moves: Type.Optional(Type.Array(Type.String(), { description: "Hypothetical <path>=<module> assignments." })),
+      merges: Type.Optional(Type.Array(Type.String(), { description: "Hypothetical <module>+<module>[+...] merges." })),
+      entityMoves: Type.Optional(Type.Array(Type.String(), { description: "Hypothetical <locator>=<header> moves." })),
+      annotations: Type.Optional(Type.Array(jsonInput, { description: "Annotation file paths or inline objects; overview, file and impact only." })),
+      churnSince: Type.Optional(Type.String({ description: "git log --since value; empty disables churn. Overview, file and impact only." })),
+      limit: Type.Optional(Type.Integer({ minimum: 0, description: "Cap overview candidates (default 20) or detail for impact, obstacles and macros." })),
+      configuration: Type.Optional(Type.String({ description: "Build configuration tag." })),
+      includeExternal: Type.Optional(Type.Boolean({ description: "Show external paths in lists rather than only counting them (default false)." })),
+      fresh: Type.Optional(enumField(kFreshModes, '"off" (default) and "auto" read the saved index; "always" re-reads changed files first.')),
+    }, { additionalProperties: false }),
+    execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      return executeModularize(ctx.cwd, params, signal);
     },
   });
 
